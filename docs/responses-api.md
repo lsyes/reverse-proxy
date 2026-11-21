@@ -325,6 +325,8 @@ total = input + output
 
 ## 5. 工具调用回收：上游把调用写进了正文
 
+> 三条路由（chat / Responses / Anthropic）共用同一个 `TextToolCallScanner`。Anthropic 路由需要把回收结果还原成 `tool_use` 块，否则 Claude Code 只会看到一段带 `<｜｜DSML｜｜>` 的正文，工具永远不会执行；流式侧还必须在打开工具块之前先关闭 thinking/text 块，Anthropic 的内容块不能交错。
+
 这个上游（以及不少国内中转）虽然接受 `tools`，但**不返回结构化 `tool_calls`**——每个 delta 的 `tool_calls` 都是空数组，调用以文本形式塞在 `content` 里：
 
 ```
@@ -365,6 +367,10 @@ Codex 每轮都带全量 `input`，所以对本项目几乎无感；但 Agents S
 ```
 
 拼接时要把"新请求的 system 前缀"提到最前面，否则 instructions 会被淹在历史里。
+
+上游侧的“会话”由请求头 `X-Conversation-ID` 标识，与本层的 `previous_response_id` 是两套东西：官方客户端一次会话复用一个 ID，一个账号下的不同会话必须区分开。代理优先转发客户端自带的 `X-Conversation-*`，其次用显式会话标识（`x-session-id` / `prompt_cache_key` / `session_id` 等）派生，两者都没有时每个请求生成新 ID；请求/消息 ID 每次上游调用重新生成，账号重试时保持不变。绝不能按账号生成会话 ID——那会把主代理、子代理和所有客户端拼成一条对话，是长会话里思维链串味和上下文膨胀的温床。
+
+回放的 `reasoning_content` / `reasoning` 字段也会在出站前剥离（`src/sanitize.rs`）：Chat Completions 没有这些输入字段，严格的上游直接丢弃，宽松的上游会把上一轮思维链当成 assistant 正文，长会话里越积越多，模型于是开始模仿“边想边说”的输出。
 
 局限与改进方向（借鉴 codex-shim / codeMUX）：
 

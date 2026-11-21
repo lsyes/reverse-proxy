@@ -135,7 +135,8 @@ claude
 - 同时支持 `Authorization: Bearer <key>` 和 `x-api-key: <key>`；
 - 支持 `/v1/messages/count_tokens`（为保证 Claude Code 的上下文统计正常工作，使用本地保守估算）；
 - 支持流式、system、图片、`tool_use` / `tool_result` 转换；
-- 扩展思考：`thinking.budget_tokens` 按档位映射（<4096 → `low`，4096–16383 → `medium`，≥16384 → `high`），流式回 `thinking` 内容块 + `thinking_delta`，非流式回 `thinking` 块；`thinking.type = "disabled"` 不发送思考档位。
+- 上游藏在 `content` 里的 DSML 工具调用会在本路由同样被回收成 `tool_use` 块（流式与非流式都支持），不会把原始标记当正文吐给客户端；
+- 扩展思考：`thinking.budget_tokens` 按档位映射（<4096 → `low`，4096–16383 → `medium`，≥16384 → `high`），自适应思考（`type: "adaptive"`）按 `high` 转发；`thinking.type = "disabled"` 不发送思考档位。只有客户端显式开启思考时才回 `thinking` 块，并附带非空 `signature`（流式为 `signature_delta`）——未签名的 thinking 块会被部分客户端判定为普通文本，下一轮回放时把思维链泄漏进可见对话。
 
 管理令牌本身也可作为特权 API key 使用（便于调试台直接调用），但建议给每个客户端单独创建密钥。
 
@@ -170,6 +171,16 @@ export WORKBUDDY_API_KEY="sk-wb-..."
 - 请求带工具时，会在最后一条用户消息之后插入一段“续跑约束”系统提示：任务没做完就必须带工具调用，不要用“我正在…”顶替动作。编码代理靠“回复里有没有工具调用”判断回合是否结束，模型一旦只输出文字就会把控制权交回给人，表现为“改了一半就停”。设 `WB_RESPONSES_NUDGE=0` 可关闭该提示做对照。
 
 响应不做持久化，`GET /v1/responses/{id}` 会返回 404。
+
+## 会话身份与上下文卫生
+
+上游按请求头里的 `X-Conversation-*` 识别“同一次对话”，官方客户端会在一次会话内复用同一个 `X-Conversation-ID`。代理的规则是：
+
+- 客户端自带非空的 `X-Conversation-ID` / `X-Conversation-Request-ID` / `X-Conversation-Message-ID` 时原样转发；
+- 否则用客户端显式声明的会话标识（`x-session-id`、`x-claude-code-session-id`、`x-opencode-session`，或请求体里的 `session_id` / `prompt_cache_key` / `conversation_id`）派生一个稳定的 UUID，让同一会话的各轮落在同一条上游对话里；
+- 两者都没有时**每个请求生成新的 UUID**。绝不能按账号派生——那会把主代理、子代理和所有客户端的对话拼成一条，另一条对话的思考过程可能回灌进来，上下文也会随运行时间无限增长。请求/消息 ID 每次上游调用重新生成，账号重试时保持不变。
+
+另一处上下文卫生：客户端会把上一轮 assistant 消息里的 `reasoning_content` / `reasoning` 等字段原样带回。Chat Completions 没有这些输入字段，上游要么丢弃，要么把它当成可见的 assistant 文本——长会话里思维链会越积越多，模型开始模仿这种“边想边说”的格式。代理在发出前统一剥离这些回放字段（`src/sanitize.rs`），Anthropic 与 Responses 适配层本来就会丢弃 thinking item。
 
 ## 账号轮询与令牌刷新
 
@@ -231,6 +242,7 @@ make web            # 构建管理台
 src/
   main.rs        启动、路由、后台任务
   config.rs      config.toml / 环境变量
+  conversation.rs 上游会话/请求 ID 的解析与派生
   state.rs       账号池、轮询、刷新、模型缓存、共享状态
   store.rs       数据持久化、JWT 解析
   upstream.rs    WorkBuddy 上游客户端

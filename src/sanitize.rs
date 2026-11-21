@@ -19,6 +19,16 @@
 //! This module rewrites the outbound request so a foreign agent's prompt
 //! survives the gateway: roles are folded onto `system`, and signatures are
 //! replaced with neutral equivalents that keep the instruction's meaning.
+//!
+//! It also removes reasoning fields that clients echo back inside assistant
+//! messages (`reasoning_content`, `reasoning`, ...). Chat Completions has no
+//! such input field: the strict upstream drops it, while a gateway that
+//! accepts it treats the previous turn's chain of thought as visible assistant
+//! text. Clients resend the whole transcript, so a long session accumulates
+//! those fields and the model starts imitating them — the reasoning leaks into
+//! ordinary answers and crowds out the real context. Replayed reasoning is
+//! dropped here for the same reason the Anthropic and Responses adapters drop
+//! thinking items: it is transport metadata, not part of the conversation.
 
 use serde_json::{json, Value};
 
@@ -53,6 +63,44 @@ fn fold_developer_role(messages: &mut [Value]) -> usize {
             .is_some_and(|r| r == "developer");
         if is_developer {
             obj.insert("role".into(), json!("system"));
+            changed += 1;
+        }
+    }
+    changed
+}
+
+/// Remove reasoning fields replayed inside assistant messages.
+///
+/// Returns the number of messages rewritten. Only assistant messages are
+/// touched: a user or tool message that happens to carry such a key is data,
+/// not replay metadata.
+fn strip_replayed_reasoning(messages: &mut [Value]) -> usize {
+    const REPLAYED_FIELDS: &[&str] = &[
+        "reasoning_content",
+        "reasoning",
+        "reasoning_details",
+        "thinking",
+        "thinking_blocks",
+    ];
+    let mut changed = 0;
+    for msg in messages.iter_mut() {
+        let Some(obj) = msg.as_object_mut() else {
+            continue;
+        };
+        let is_assistant = obj
+            .get("role")
+            .and_then(Value::as_str)
+            .is_some_and(|role| role == "assistant");
+        if !is_assistant {
+            continue;
+        }
+        let mut touched = false;
+        for field in REPLAYED_FIELDS {
+            if obj.remove(*field).is_some() {
+                touched = true;
+            }
+        }
+        if touched {
             changed += 1;
         }
     }
@@ -130,12 +178,14 @@ pub struct SanitizeReport {
     pub developer_roles: usize,
     /// String leaves whose signature text was rewritten.
     pub scrubbed_strings: usize,
+    /// Assistant messages whose replayed reasoning fields were removed.
+    pub stripped_reasoning: usize,
 }
 
 impl SanitizeReport {
     /// Whether the request was left byte-identical.
     pub fn is_noop(&self) -> bool {
-        self.developer_roles == 0 && self.scrubbed_strings == 0
+        self.developer_roles == 0 && self.scrubbed_strings == 0 && self.stripped_reasoning == 0
     }
 }
 
@@ -151,6 +201,7 @@ pub fn sanitize_chat_body(body: &mut Value) -> SanitizeReport {
 
     if let Some(messages) = obj.get_mut("messages").and_then(Value::as_array_mut) {
         report.developer_roles = fold_developer_role(messages);
+        report.stripped_reasoning = strip_replayed_reasoning(messages);
         // Only message content is signature-scrubbed: that is where agent
         // system prompts and turns live. Scrubbing the whole body would also
         // rewrite caller tool schemas, which the gateway accepts untouched.
@@ -268,6 +319,40 @@ mod tests {
             b["messages"][0]["content"].as_str().unwrap(),
             "Web GUI and Web GUI again"
         );
+    }
+
+    #[test]
+    fn replayed_reasoning_is_not_sent_upstream() {
+        let mut b = body(json!([
+            {
+                "role": "assistant",
+                "content": "the answer",
+                "reasoning_content": "chain of thought",
+                "reasoning": "chain of thought",
+                "reasoning_details": [{"type": "reasoning.text", "text": "chain of thought"}]
+            },
+            { "role": "user", "content": "next" }
+        ]));
+        let r = sanitize_chat_body(&mut b);
+        assert_eq!(r.stripped_reasoning, 1);
+        assert!(b["messages"][0].get("reasoning_content").is_none());
+        assert!(b["messages"][0].get("reasoning").is_none());
+        assert!(b["messages"][0].get("reasoning_details").is_none());
+        assert_eq!(b["messages"][0]["content"], "the answer");
+        assert_eq!(b["messages"][1]["content"], "next");
+    }
+
+    #[test]
+    fn reasoning_fields_on_non_assistant_messages_are_left_alone() {
+        let mut b = body(json!([
+            { "role": "user", "content": "x", "reasoning": "user data" },
+            { "role": "tool", "tool_call_id": "t", "content": "y", "reasoning": "tool data" }
+        ]));
+        let before = b.clone();
+        let r = sanitize_chat_body(&mut b);
+        assert_eq!(r.stripped_reasoning, 0);
+        assert!(r.is_noop());
+        assert_eq!(b, before);
     }
 
     #[test]

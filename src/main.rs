@@ -1,5 +1,6 @@
 mod api;
 mod config;
+mod conversation;
 mod error;
 mod inband;
 mod sanitize;

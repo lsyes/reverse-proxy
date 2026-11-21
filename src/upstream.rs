@@ -1,4 +1,5 @@
 use crate::config::UpstreamConfig;
+use crate::conversation::ConversationIds;
 use anyhow::{Context, Result};
 use reqwest::{Response, StatusCode};
 use serde_json::Value;
@@ -41,14 +42,13 @@ impl UpstreamClient {
     pub async fn chat(
         &self,
         endpoint: &str,
-        account_id: &str,
         token: &str,
         uid: &str,
         model: &str,
         body: &Value,
+        conversation: &ConversationIds,
     ) -> Result<Response> {
         let url = format!("{}/v2/chat/completions", Self::base(endpoint));
-        let request_id = uuid::Uuid::new_v4().simple().to_string();
         let mut req = self
             .http
             .post(&url)
@@ -57,7 +57,7 @@ impl UpstreamClient {
             .header("Accept", "text/event-stream")
             .header("X-Requested-With", "XMLHttpRequest")
             .header("X-Model-ID", model)
-            .header("X-Request-ID", &request_id)
+            .header("X-Request-ID", &conversation.message_id)
             .header("X-Product", &self.cfg.product_type)
             .header("X-Agent-Intent", "craft")
             .header("X-Agent-Type", "main")
@@ -72,9 +72,9 @@ impl UpstreamClient {
             req = req.header("X-User-Id", uid);
         }
         req = req
-            .header("X-Conversation-ID", request_id_with_prefix(account_id))
-            .header("X-Conversation-Request-ID", &request_id)
-            .header("X-Conversation-Message-ID", &request_id);
+            .header("X-Conversation-ID", &conversation.conversation_id)
+            .header("X-Conversation-Request-ID", &conversation.request_id)
+            .header("X-Conversation-Message-ID", &conversation.message_id);
         req.send().await.context("sending upstream chat request")
     }
 
@@ -146,12 +146,6 @@ impl UpstreamClient {
         serde_json::from_str(&text)
             .with_context(|| format!("models response is not json: {}", truncate(&text, 300)))
     }
-}
-
-fn request_id_with_prefix(account_id: &str) -> String {
-    let suffix = account_id.replace('-', "");
-    let suffix = suffix.get(..12).unwrap_or(&suffix);
-    format!("wbproxy-{suffix}")
 }
 
 pub fn parse_upstream_error(status: StatusCode, body: &str) -> (String, Option<String>) {
@@ -253,14 +247,5 @@ mod tests {
     fn truncates_on_char_boundaries() {
         assert_eq!(truncate("short", 10), "short");
         assert_eq!(truncate("你好世界", 2), "你好...");
-    }
-
-    #[test]
-    fn makes_proxy_conversation_id_safe() {
-        assert_eq!(
-            request_id_with_prefix("bca2adce-ce3c-4e3a-a3bc-06d4b8d8d01f"),
-            "wbproxy-bca2adcece3c"
-        );
-        assert_eq!(request_id_with_prefix("short"), "wbproxy-short");
     }
 }

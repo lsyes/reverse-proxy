@@ -16,6 +16,7 @@
 //! only read `function_call` items still see their tool calls.
 
 use crate::api::openai::{stream_error_message, ChatAggregate};
+use crate::conversation::ConversationIds;
 use crate::error::{ApiError, ApiResult};
 use crate::inband::{TextToolCall, TextToolCallScanner};
 use crate::sanitize::sanitize_chat_body;
@@ -25,7 +26,7 @@ use crate::store::{Account, RequestRecord};
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -65,6 +66,7 @@ fn save_history(id: String, messages: Vec<Value>) {
 
 pub async fn create(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let Json(body) = match payload {
@@ -86,7 +88,8 @@ pub async fn create(
         .map(str::to_string);
     let model = state.resolve_model(requested.as_deref()).await;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    match response_impl(state.clone(), body, model.clone()).await {
+    let conversation = ConversationIds::from_request(&headers, &body);
+    match response_impl(state.clone(), body, model.clone(), conversation).await {
         Ok(r) => r,
         Err(e) => {
             state
@@ -129,7 +132,12 @@ pub async fn delete(axum::extract::Path(id): axum::extract::Path<String>) -> Res
     .into_response()
 }
 
-async fn response_impl(state: SharedState, body: Value, model: String) -> ApiResult<Response> {
+async fn response_impl(
+    state: SharedState,
+    body: Value,
+    model: String,
+    conversation: ConversationIds,
+) -> ApiResult<Response> {
     let obj = body
         .as_object()
         .ok_or_else(|| ApiError::bad_request("request body must be a JSON object"))?;
@@ -196,13 +204,16 @@ async fn response_impl(state: SharedState, body: Value, model: String) -> ApiRes
         tracing::debug!(
             developer_roles = sanitized.developer_roles,
             scrubbed_strings = sanitized.scrubbed_strings,
+            stripped_reasoning = sanitized.stripped_reasoning,
             model = %model,
             "rewrote responses request for upstream channel compatibility"
         );
     }
 
     let started = Instant::now();
-    let (account, resp) = state.chat_with_rotation(&upstream_body, &model).await?;
+    let (account, resp) = state
+        .chat_with_rotation(&upstream_body, &model, &conversation)
+        .await?;
 
     let response_id = format!("resp_{}", uuid::Uuid::new_v4().simple());
     let created = now_ms() / 1000;
@@ -370,6 +381,16 @@ fn reasoning_envelope(effort: Option<&str>) -> Value {
     })
 }
 
+/// Whether `needle` already appears as a contiguous run inside `haystack`.
+fn contains_messages(haystack: &[Value], needle: &[Value]) -> bool {
+    if needle.is_empty() || needle.len() > haystack.len() {
+        return false;
+    }
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
 /// Flatten `instructions` + `input[]` into chat `messages[]`.
 fn build_messages(obj: &Map<String, Value>, previous: Option<&str>) -> ApiResult<Vec<Value>> {
     let mut messages: Vec<Value> = Vec::new();
@@ -406,10 +427,17 @@ fn build_messages(obj: &Map<String, Value>, previous: Option<&str>) -> ApiResult
                     .and_then(Value::as_str)
                     == Some("system"),
             );
-            let mut merged: Vec<Value> = messages[..split].to_vec();
-            merged.extend(history);
-            merged.extend(messages[split..].iter().cloned());
-            messages = merged;
+            // Some clients send the whole transcript *and* the previous
+            // response id. Prepending the stored history in that case
+            // duplicates the conversation on every turn, doubling the prompt
+            // until the upstream truncates or the client compacts — the
+            // classic long-session "gets dumber" shape.
+            if !contains_messages(&messages[split..], &history) {
+                let mut merged: Vec<Value> = messages[..split].to_vec();
+                merged.extend(history);
+                merged.extend(messages[split..].iter().cloned());
+                messages = merged;
+            }
         }
     }
     if messages.is_empty() {
@@ -1145,7 +1173,12 @@ fn stream_body(
                             });
                             failed = Some(message);
                             yield Ok::<Bytes, std::io::Error>(event("response.failed", payload));
-                            continue;
+                            // A failed response is terminal: do not fall through
+                            // to the normal output/completed sequence below, or
+                            // the client sees a completed response carrying
+                            // partial text after the error.
+                            completed = true;
+                            break;
                         }
                         if let Some(u) = v.get("usage").filter(|u| !u.is_null()) {
                             usage = Some(u.clone());
@@ -1257,6 +1290,9 @@ fn stream_body(
                                 "delta": visible,
                             }),
                         ));
+                    }
+                    if completed {
+                        break;
                     }
                 }
                 Err(e) => {
@@ -1825,6 +1861,46 @@ mod tests {
         assert_eq!(messages.len(), 2);
         assert_eq!(messages[0]["content"], "first");
         assert_eq!(messages[1]["content"], "second");
+    }
+
+    #[test]
+    fn full_input_with_previous_id_is_not_duplicated() {
+        let id = "resp_test_no_dup".to_string();
+        save_history(
+            id.clone(),
+            vec![
+                json!({"role": "user", "content": "first"}),
+                json!({"role": "assistant", "content": "answer"}),
+            ],
+        );
+        let body = json!({
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "first"}]},
+                {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "answer"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "second"}]}
+            ]
+        });
+        let messages = build_messages(body.as_object().unwrap(), Some(&id)).unwrap();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages[2]["content"], "second");
+    }
+
+    #[test]
+    fn full_input_with_instructions_and_previous_id_is_not_duplicated() {
+        let id = "resp_test_no_dup_sys".to_string();
+        save_history(id.clone(), vec![json!({"role": "user", "content": "task"})]);
+        let body = json!({
+            "instructions": "sys",
+            "input": [
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "task"}]},
+                {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "next"}]}
+            ]
+        });
+        let messages = build_messages(body.as_object().unwrap(), Some(&id)).unwrap();
+        assert_eq!(messages.len(), 3, "{messages:?}");
+        assert_eq!(messages[0]["role"], "system");
+        assert_eq!(messages[1]["content"], "task");
+        assert_eq!(messages[2]["content"], "next");
     }
 
     #[test]

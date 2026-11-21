@@ -1,3 +1,4 @@
+use crate::conversation::ConversationIds;
 use crate::error::{ApiError, ApiResult};
 use crate::inband::{to_openai_tool_call, TextToolCall, TextToolCallScanner};
 use crate::sanitize::sanitize_chat_body;
@@ -7,7 +8,7 @@ use crate::store::{Account, RequestRecord};
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -72,6 +73,7 @@ pub async fn get_model(
 
 pub async fn chat_completions(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let Json(body) = match payload {
@@ -93,7 +95,8 @@ pub async fn chat_completions(
         .map(str::to_string);
     let model = state.resolve_model(requested.as_deref()).await;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    match chat_impl(state.clone(), body, model.clone()).await {
+    let conversation = ConversationIds::from_request(&headers, &body);
+    match chat_impl(state.clone(), body, model.clone(), conversation).await {
         Ok(r) => r,
         Err(e) => {
             state
@@ -116,7 +119,12 @@ pub async fn chat_completions(
     }
 }
 
-async fn chat_impl(state: SharedState, body: Value, model: String) -> ApiResult<Response> {
+async fn chat_impl(
+    state: SharedState,
+    body: Value,
+    model: String,
+    conversation: ConversationIds,
+) -> ApiResult<Response> {
     let obj = body
         .as_object()
         .ok_or_else(|| ApiError::bad_request("request body must be a JSON object"))?;
@@ -152,6 +160,7 @@ async fn chat_impl(state: SharedState, body: Value, model: String) -> ApiResult<
         tracing::debug!(
             developer_roles = sanitized.developer_roles,
             scrubbed_strings = sanitized.scrubbed_strings,
+            stripped_reasoning = sanitized.stripped_reasoning,
             model = %model,
             "rewrote request for upstream channel compatibility"
         );
@@ -159,7 +168,9 @@ async fn chat_impl(state: SharedState, body: Value, model: String) -> ApiResult<
 
     let started = Instant::now();
 
-    let (account, resp) = state.chat_with_rotation(&upstream_body, &model).await?;
+    let (account, resp) = state
+        .chat_with_rotation(&upstream_body, &model, &conversation)
+        .await?;
 
     if client_stream {
         let content_type = resp

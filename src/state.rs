@@ -1,4 +1,5 @@
 use crate::config::{expand_tilde, Config};
+use crate::conversation::ConversationIds;
 use crate::error::ApiError;
 pub use crate::store::now_ms;
 use crate::store::{
@@ -478,6 +479,7 @@ impl AppState {
         &self,
         body: &Value,
         model: &str,
+        conversation: &ConversationIds,
     ) -> Result<(Account, Response), ApiError> {
         let attempts = self.select_accounts(&HashSet::new()).await;
         if attempts.is_empty() {
@@ -503,7 +505,14 @@ impl AppState {
             let started = std::time::Instant::now();
             let resp = match self
                 .http
-                .chat(&endpoint, &acc.id, &acc.access_token, &acc.uid, model, body)
+                .chat(
+                    &endpoint,
+                    &acc.access_token,
+                    &acc.uid,
+                    model,
+                    body,
+                    conversation,
+                )
                 .await
             {
                 Ok(r) => r,
@@ -536,11 +545,11 @@ impl AppState {
                             .http
                             .chat(
                                 &endpoint,
-                                &fresh.id,
                                 &fresh.access_token,
                                 &fresh.uid,
                                 model,
                                 body,
+                                conversation,
                             )
                             .await
                         {
@@ -1091,15 +1100,16 @@ impl AppState {
             "stream": true
         });
         let started = std::time::Instant::now();
+        let conversation = ConversationIds::fresh();
         let resp = self
             .http
             .chat(
                 &endpoint,
-                &acc.id,
                 &acc.access_token,
                 &acc.uid,
                 "auto",
                 &body,
+                &conversation,
             )
             .await
             .map_err(|e| ApiError::upstream(StatusCode::BAD_GATEWAY, format!("{e:#}"), None))?;

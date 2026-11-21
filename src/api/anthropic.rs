@@ -1,4 +1,6 @@
+use crate::conversation::ConversationIds;
 use crate::error::{anthropic_error, ApiError, ApiResult};
+use crate::inband::{TextToolCall, TextToolCallScanner};
 use crate::sanitize::sanitize_chat_body;
 use crate::sse::{sse_event, SseBuffer};
 use crate::state::{now_ms, SharedState};
@@ -7,7 +9,7 @@ use crate::tokens::estimate_chat_tokens;
 use axum::body::Body;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::State;
-use axum::http::{header, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::Json;
 use bytes::Bytes;
@@ -18,6 +20,7 @@ use std::time::Instant;
 
 pub async fn messages(
     State(state): State<SharedState>,
+    headers: HeaderMap,
     payload: Result<Json<Value>, JsonRejection>,
 ) -> Response {
     let Json(body) = match payload {
@@ -38,7 +41,8 @@ pub async fn messages(
         .map(str::to_string);
     let model = state.resolve_model(requested.as_deref()).await;
     let stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
-    match messages_impl(state.clone(), body, model.clone()).await {
+    let conversation = ConversationIds::from_request(&headers, &body);
+    match messages_impl(state.clone(), body, model.clone(), conversation).await {
         Ok(r) => r,
         Err(e) => {
             state
@@ -86,8 +90,14 @@ fn count_tokens_impl(body: Value) -> ApiResult<u64> {
     Ok(estimate_chat_tokens(&openai_body))
 }
 
-async fn messages_impl(state: SharedState, body: Value, model: String) -> ApiResult<Response> {
+async fn messages_impl(
+    state: SharedState,
+    body: Value,
+    model: String,
+    conversation: ConversationIds,
+) -> ApiResult<Response> {
     let client_stream = body.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let emit_thinking = thinking_requested(&body);
     let (openai_body, max_tokens) = anthropic_to_openai(&body)?;
     let mut openai_body = openai_body;
     {
@@ -103,12 +113,15 @@ async fn messages_impl(state: SharedState, body: Value, model: String) -> ApiRes
     if !sanitized.is_noop() {
         tracing::debug!(
             scrubbed_strings = sanitized.scrubbed_strings,
+            stripped_reasoning = sanitized.stripped_reasoning,
             model = %model,
             "rewrote anthropic-derived request for upstream channel compatibility"
         );
     }
     let started = Instant::now();
-    let (account, resp) = state.chat_with_rotation(&openai_body, &model).await?;
+    let (account, resp) = state
+        .chat_with_rotation(&openai_body, &model, &conversation)
+        .await?;
     let status = resp.status();
     if !status.is_success() {
         let text = resp.text().await.unwrap_or_default();
@@ -140,6 +153,7 @@ async fn messages_impl(state: SharedState, body: Value, model: String) -> ApiRes
             resp.bytes_stream(),
             model,
             max_tokens,
+            emit_thinking,
             started,
         );
         let mut res = Response::new(body);
@@ -191,8 +205,11 @@ async fn messages_impl(state: SharedState, body: Value, model: String) -> ApiRes
         let (msg, code) = crate::upstream::parse_upstream_error(StatusCode::BAD_GATEWAY, &text);
         return Err(ApiError::upstream(StatusCode::BAD_GATEWAY, msg, code));
     }
+    // The gateway hides tool invocations in `content` as DSML text; a standard
+    // Anthropic client only reads `tool_use` blocks, so recover them first.
+    agg.recover_inband_tool_calls();
     let usage = agg.usage.clone();
-    let out = to_anthropic_response(&agg, &model, max_tokens);
+    let out = to_anthropic_response(&agg, &model, max_tokens, emit_thinking);
     let latency = started.elapsed().as_millis() as u64;
     state
         .record_request(RequestRecord {
@@ -226,6 +243,7 @@ fn anthropic_stream_body(
     upstream: impl futures_util::Stream<Item = reqwest::Result<Bytes>> + Send + 'static,
     model: String,
     _max_tokens: i64,
+    emit_thinking: bool,
     started: Instant,
 ) -> Body {
     let stream = async_stream::stream! {
@@ -248,14 +266,19 @@ fn anthropic_stream_body(
         let mut parser = SseBuffer::new();
         let mut upstream = Box::pin(upstream);
         let mut text_open = false;
+        let mut text_seen = false;
         let mut text_block_index: i64 = 0;
         let mut thinking_open = false;
         let mut thinking_block_index: i64 = 0;
-        let mut thinking_seen = false;
+        let mut thinking_signature = String::new();
         let mut next_index: i64 = 0;
-        let tool_blocks: BTreeMap<usize, i64> = BTreeMap::new();
-        let mut open_blocks: Vec<i64> = Vec::new();
         let mut pending_tools: BTreeMap<usize, PendingToolCall> = BTreeMap::new();
+        let mut recovered: Vec<TextToolCall> = Vec::new();
+        // The gateway does not emit structured tool calls: the invocation
+        // arrives as DSML text inside `content`. An Anthropic client only acts
+        // on `tool_use` blocks, so scan the text and emit the calls; otherwise
+        // the markup leaks into the visible answer and the tool never runs.
+        let mut scanner = TextToolCallScanner::new();
         let mut finish_reason: Option<String> = None;
         let mut usage: Option<Value> = None;
         let mut failed: Option<String> = None;
@@ -286,105 +309,116 @@ fn anthropic_stream_body(
                             }
                         }
                         let Some(delta) = choice.get("delta") else { continue };
+
                         // Thinking must be a separate content block and must not
                         // be interleaved with text: Anthropic clients dispatch on
-                        // block order, and a text block reopened after a thinking
-                        // block would break the assistant turn they replay.
-                        if let Some(r) = delta
-                            .get("reasoning_content")
-                            .and_then(Value::as_str)
-                            .filter(|s| !s.is_empty())
-                        {
-                            if !thinking_open && !text_open {
-                                thinking_open = true;
-                                thinking_seen = true;
-                                thinking_block_index = next_index;
-                                open_blocks.push(next_index);
-                                let ev = json!({
-                                    "type": "content_block_start",
-                                    "index": next_index,
-                                    "content_block": {"type": "thinking", "thinking": "", "signature": ""}
-                                });
-                                yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
-                                next_index += 1;
-                            }
-                            if thinking_open {
-                                let ev = json!({
-                                    "type": "content_block_delta",
-                                    "index": thinking_block_index,
-                                    "delta": {"type": "thinking_delta", "thinking": r}
-                                });
-                                yield Ok(Bytes::from(sse_event("content_block_delta", &ev.to_string())));
+                        // block order. Only emit it when requested — an
+                        // unrequested block is leaked reasoning, and clients that
+                        // cannot replay it demote it to visible text.
+                        if emit_thinking {
+                            if let Some(r) = delta
+                                .get("reasoning_content")
+                                .and_then(Value::as_str)
+                                .filter(|s| !s.is_empty())
+                            {
+                                if !thinking_open && !text_open {
+                                    thinking_open = true;
+                                    thinking_block_index = next_index;
+                                    next_index += 1;
+                                    thinking_signature = new_thinking_signature();
+                                    let ev = json!({
+                                        "type": "content_block_start",
+                                        "index": thinking_block_index,
+                                        "content_block": {"type": "thinking", "thinking": "", "signature": ""}
+                                    });
+                                    yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
+                                }
+                                if thinking_open {
+                                    let ev = json!({
+                                        "type": "content_block_delta",
+                                        "index": thinking_block_index,
+                                        "delta": {"type": "thinking_delta", "thinking": r}
+                                    });
+                                    yield Ok(Bytes::from(sse_event("content_block_delta", &ev.to_string())));
+                                }
                             }
                         }
+
                         if let Some(t) = delta.get("content").and_then(Value::as_str) {
                             if !t.is_empty() {
+                                let (visible, calls) = scanner.push(t);
+                                recovered.extend(calls);
+                                if visible.is_empty() {
+                                    continue;
+                                }
                                 // First visible text ends the thinking phase.
                                 if thinking_open {
+                                    yield Ok(Bytes::from(sse_event(
+                                        "content_block_delta",
+                                        &json!({
+                                            "type": "content_block_delta",
+                                            "index": thinking_block_index,
+                                            "delta": {"type": "signature_delta", "signature": thinking_signature}
+                                        })
+                                        .to_string(),
+                                    )));
                                     let ev = json!({
                                         "type": "content_block_stop",
                                         "index": thinking_block_index
                                     });
                                     yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
                                     thinking_open = false;
-                                    // Closed here, so the trailing close loop must
-                                    // not stop the same block a second time.
-                                    open_blocks.retain(|i| *i != thinking_block_index);
                                 }
                                 if !text_open {
                                     text_open = true;
+                                    text_seen = true;
                                     text_block_index = next_index;
-                                    open_blocks.push(next_index);
+                                    next_index += 1;
                                     let ev = json!({
                                         "type": "content_block_start",
-                                        "index": next_index,
+                                        "index": text_block_index,
                                         "content_block": {"type": "text", "text": ""}
                                     });
                                     yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
-                                    next_index += 1;
                                 }
                                 let ev = json!({
                                     "type": "content_block_delta",
                                     "index": text_block_index,
-                                    "delta": {"type": "text_delta", "text": t}
+                                    "delta": {"type": "text_delta", "text": visible}
                                 });
                                 yield Ok(Bytes::from(sse_event("content_block_delta", &ev.to_string())));
                             }
                         }
+
+                        // Structured calls are accumulated, not streamed: a name
+                        // or argument JSON can span chunks, and Anthropic wants
+                        // one complete tool_use block per call.
                         if let Some(tcs) = delta.get("tool_calls").and_then(Value::as_array) {
                             for (fallback_idx, tc) in tcs.iter().enumerate() {
-                                let uidx = tc.get("index").and_then(Value::as_u64).map(|v| v as usize).unwrap_or(fallback_idx);
+                                let uidx = tc
+                                    .get("index")
+                                    .and_then(Value::as_u64)
+                                    .map(|v| v as usize)
+                                    .unwrap_or(fallback_idx);
                                 let pending = pending_tools.entry(uidx).or_default();
                                 if let Some(id) = tc.get("id").and_then(Value::as_str) {
                                     if !id.is_empty() {
                                         pending.id = Some(id.to_string());
                                     }
                                 }
-                                let args = tc
+                                if let Some(name) = tc
+                                    .get("function")
+                                    .and_then(|f| f.get("name"))
+                                    .and_then(Value::as_str)
+                                {
+                                    pending.name.push_str(name);
+                                }
+                                if let Some(args) = tc
                                     .get("function")
                                     .and_then(|f| f.get("arguments"))
                                     .and_then(Value::as_str)
-                                    .unwrap_or_default();
-                                if let Some(name) = tc.get("function").and_then(|f| f.get("name")).and_then(Value::as_str) {
-                                    pending.name.push_str(name);
-                                }
-
-                                let block_index = if let Some(i) = tool_blocks.get(&uidx) {
-                                    *i
-                                } else {
-                                    // The name and arguments can span multiple chunks.
-                                    // Do not open a block until the stream has fully
-                                    // arrived, so clients receive one complete name.
+                                {
                                     pending.arguments.push_str(args);
-                                    continue;
-                                };
-                                if !args.is_empty() {
-                                    let ev = json!({
-                                        "type": "content_block_delta",
-                                        "index": block_index,
-                                        "delta": {"type": "input_json_delta", "partial_json": args}
-                                    });
-                                    yield Ok(Bytes::from(sse_event("content_block_delta", &ev.to_string())));
                                 }
                             }
                         }
@@ -400,65 +434,114 @@ fn anthropic_stream_body(
             }
         }
 
-        let output_tokens = usage.as_ref().and_then(|u| u.get("completion_tokens")).and_then(Value::as_u64).unwrap_or(0);
-        let input_tokens = usage.as_ref().and_then(|u| u.get("prompt_tokens")).and_then(Value::as_u64).unwrap_or(0);
+        let output_tokens = usage
+            .as_ref()
+            .and_then(|u| u.get("completion_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        let input_tokens = usage
+            .as_ref()
+            .and_then(|u| u.get("prompt_tokens"))
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+
+        // Flush the scanner before finalizing: the last delta may still hold a
+        // partial marker, or a truncated block may still contain a full call.
+        let (tail_text, tail_calls) = scanner.finish();
+        recovered.extend(tail_calls);
 
         // Do not emit a normal message_end after a stream error: Anthropic
         // clients expect the error event to terminate the message.
-        let has_pending_tools = !pending_tools.is_empty();
         if failed.is_none() {
-            // Some upstreams send the tool name as a final chunk without any
-            // arguments. Emit those blocks before closing the message.
-            for (uidx, pending) in pending_tools {
-                if tool_blocks.contains_key(&uidx) {
-                    continue;
+            if !tail_text.is_empty() {
+                if thinking_open {
+                    yield Ok(Bytes::from(sse_event(
+                        "content_block_delta",
+                        &json!({
+                            "type": "content_block_delta",
+                            "index": thinking_block_index,
+                            "delta": {"type": "signature_delta", "signature": thinking_signature}
+                        })
+                        .to_string(),
+                    )));
+                    let ev = json!({"type": "content_block_stop", "index": thinking_block_index});
+                    yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
+                    thinking_open = false;
                 }
-                // Anthropic requires a non-empty tool name.
-                if pending.name.is_empty() {
-                    continue;
+                if !text_open {
+                    text_open = true;
+                    text_seen = true;
+                    text_block_index = next_index;
+                    next_index += 1;
+                    let ev = json!({
+                        "type": "content_block_start",
+                        "index": text_block_index,
+                        "content_block": {"type": "text", "text": ""}
+                    });
+                    yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
                 }
+                let ev = json!({
+                    "type": "content_block_delta",
+                    "index": text_block_index,
+                    "delta": {"type": "text_delta", "text": tail_text}
+                });
+                yield Ok(Bytes::from(sse_event("content_block_delta", &ev.to_string())));
+            }
+
+            // Close thinking and text before opening tool blocks. Anthropic
+            // content blocks are sequential: a block started while another is
+            // still open is rejected by strict clients.
+            if thinking_open {
+                yield Ok(Bytes::from(sse_event(
+                    "content_block_delta",
+                    &json!({
+                        "type": "content_block_delta",
+                        "index": thinking_block_index,
+                        "delta": {"type": "signature_delta", "signature": thinking_signature}
+                    })
+                    .to_string(),
+                )));
+                let ev = json!({"type": "content_block_stop", "index": thinking_block_index});
+                yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
+            }
+            if text_open {
+                let ev = json!({"type": "content_block_stop", "index": text_block_index});
+                yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
+            }
+
+            let calls = collect_tool_calls(&pending_tools, &recovered);
+            for call in &calls {
                 let bi = next_index;
                 next_index += 1;
-                open_blocks.push(bi);
-                let id = pending.id
-                    .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4().simple()));
                 let ev = json!({
                     "type": "content_block_start",
                     "index": bi,
-                    "content_block": {"type": "tool_use", "id": id, "name": pending.name, "input": {}}
+                    "content_block": {"type": "tool_use", "id": call.id, "name": call.name, "input": {}}
                 });
                 yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
-                if !pending.arguments.is_empty() {
+                if !call.arguments.is_empty() {
                     let delta = json!({
                         "type": "content_block_delta",
                         "index": bi,
-                        "delta": {"type": "input_json_delta", "partial_json": pending.arguments}
+                        "delta": {"type": "input_json_delta", "partial_json": call.arguments}
                     });
                     yield Ok(Bytes::from(sse_event("content_block_delta", &delta.to_string())));
                 }
+                let ev = json!({"type": "content_block_stop", "index": bi});
+                yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
             }
-            // Anthropic wants at least one content block; a thinking-only turn
-            // still needs a trailing text block, and its index must continue
-            // past the thinking block rather than reuse index 0.
-            if !text_open && tool_blocks.is_empty() && !has_pending_tools {
-                let bi = if thinking_seen { next_index } else { 0 };
+
+            // Anthropic wants at least one content block. A thinking-only turn
+            // still gets a trailing empty text block, after the thinking block.
+            if !text_seen && calls.is_empty() {
+                let bi = next_index;
                 let ev = json!({"type": "content_block_start", "index": bi, "content_block": {"type": "text", "text": ""}});
                 yield Ok(Bytes::from(sse_event("content_block_start", &ev.to_string())));
-                open_blocks.push(bi);
-            }
-            if thinking_open {
-                let ev = json!({"type": "content_block_stop", "index": thinking_block_index});
-                yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
-                open_blocks.retain(|i| *i != thinking_block_index);
-            }
-            for idx in &open_blocks {
-                let ev = json!({"type": "content_block_stop", "index": idx});
+                let ev = json!({"type": "content_block_stop", "index": bi});
                 yield Ok(Bytes::from(sse_event("content_block_stop", &ev.to_string())));
             }
-            let stop_reason = map_stop_reason(
-                finish_reason.as_deref(),
-                !tool_blocks.is_empty() || has_pending_tools,
-            );
+
+            let stop_reason = map_stop_reason(finish_reason.as_deref(), !calls.is_empty());
             let ev = json!({
                 "type": "message_delta",
                 "delta": {"stop_reason": stop_reason, "stop_sequence": Value::Null},
@@ -493,8 +576,76 @@ struct PendingToolCall {
     arguments: String,
 }
 
+struct FinalToolCall {
+    id: String,
+    name: String,
+    arguments: String,
+}
+
+/// Merge structured and recovered calls into the blocks to emit.
+///
+/// The upstream normally uses only one channel; de-duplicating by
+/// `(name, arguments)` keeps a gateway that uses both from executing a call
+/// twice.
+fn collect_tool_calls(
+    pending: &BTreeMap<usize, PendingToolCall>,
+    recovered: &[TextToolCall],
+) -> Vec<FinalToolCall> {
+    let mut out = Vec::new();
+    let mut seen: BTreeMap<(String, String), ()> = BTreeMap::new();
+    for call in recovered {
+        push_tool_call(
+            &mut out,
+            &mut seen,
+            &call.name,
+            &call.arguments.to_string(),
+            None,
+        );
+    }
+    for pending in pending.values() {
+        push_tool_call(
+            &mut out,
+            &mut seen,
+            &pending.name,
+            &pending.arguments,
+            pending.id.clone(),
+        );
+    }
+    out
+}
+
+fn push_tool_call(
+    out: &mut Vec<FinalToolCall>,
+    seen: &mut BTreeMap<(String, String), ()>,
+    name: &str,
+    arguments: &str,
+    id: Option<String>,
+) {
+    let name = name.trim();
+    if name.is_empty() {
+        return;
+    }
+    let key = (name.to_string(), arguments.to_string());
+    if seen.insert(key, ()).is_some() {
+        return;
+    }
+    let id = id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| format!("toolu_{}", uuid::Uuid::new_v4().simple()));
+    out.push(FinalToolCall {
+        id,
+        name: name.to_string(),
+        arguments: arguments.to_string(),
+    });
+}
+
 #[cfg(test)]
 async fn test_anthropic_stream(chunks: Vec<Bytes>) -> String {
+    test_anthropic_stream_with(chunks, false).await
+}
+
+#[cfg(test)]
+async fn test_anthropic_stream_with(chunks: Vec<Bytes>, emit_thinking: bool) -> String {
     use futures_util::StreamExt as _;
 
     let data_dir =
@@ -511,7 +662,15 @@ async fn test_anthropic_stream(chunks: Vec<Bytes>) -> String {
     );
     let account = crate::store::Account::new("test".into(), "token".into());
     let upstream = futures_util::stream::iter(chunks.into_iter().map(Ok));
-    let body = anthropic_stream_body(state, account, upstream, "auto".into(), 64, Instant::now());
+    let body = anthropic_stream_body(
+        state,
+        account,
+        upstream,
+        "auto".into(),
+        64,
+        emit_thinking,
+        Instant::now(),
+    );
     let mut body = body.into_data_stream();
     let mut out = String::new();
     while let Some(Ok(chunk)) = body.next().await {
@@ -714,6 +873,12 @@ fn reasoning_effort_from_thinking(obj: &Map<String, Value>) -> Option<&'static s
         .get("type")
         .and_then(Value::as_str)
         .unwrap_or("enabled");
+    // Adaptive thinking has no explicit budget: the model decides. Asking the
+    // upstream for the highest level is the closest equivalent; treating it as
+    // "not enabled" silently downgrades the caller to the upstream default.
+    if kind == "adaptive" {
+        return Some("high");
+    }
     if kind != "enabled" {
         return None;
     }
@@ -726,6 +891,31 @@ fn reasoning_effort_from_thinking(obj: &Map<String, Value>) -> Option<&'static s
         4096..=16383 => "medium",
         16384..=i64::MAX => "high",
     })
+}
+
+/// Whether the caller asked for a thinking content block.
+///
+/// Anthropic only returns `thinking` blocks when the request enables them.
+/// Surfacing the upstream's default reasoning to a caller that did not ask is
+/// both a protocol violation and a chain-of-thought leak.
+fn thinking_requested(body: &Value) -> bool {
+    body.get("thinking")
+        .and_then(|thinking| thinking.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| matches!(kind, "enabled" | "adaptive"))
+}
+
+/// Opaque, non-empty signature for a synthesized thinking block.
+///
+/// Anthropic clients never verify it cryptographically; they only echo it back
+/// when replaying the assistant turn, and this proxy ignores replayed thinking
+/// blocks. What matters is that it is non-empty: compatible clients (pi-ai
+/// among them) convert unsigned thinking into visible text on replay, which is
+/// exactly the long-session chain-of-thought leak this guard prevents.
+fn new_thinking_signature() -> String {
+    use base64::Engine;
+    base64::engine::general_purpose::STANDARD
+        .encode(format!("wbproxy:thinking:{}", uuid::Uuid::new_v4()))
 }
 
 fn blocks_to_text(v: &Value) -> String {
@@ -766,10 +956,19 @@ pub fn to_anthropic_response(
     agg: &crate::api::openai::ChatAggregate,
     model: &str,
     _max_tokens: i64,
+    emit_thinking: bool,
 ) -> Value {
     let mut content = Vec::new();
-    if !agg.reasoning.is_empty() {
-        content.push(json!({"type": "thinking", "thinking": agg.reasoning, "signature": ""}));
+    if emit_thinking && !agg.reasoning.is_empty() {
+        // Emit a non-empty signature: clients only echo it back, and an
+        // unsigned thinking block is demoted to visible assistant text by
+        // compatible runtimes (pi-ai, several gateways), which leaks the chain
+        // of thought into the replayed conversation.
+        content.push(json!({
+            "type": "thinking",
+            "thinking": agg.reasoning,
+            "signature": new_thinking_signature(),
+        }));
     }
     if !agg.content.is_empty() {
         content.push(json!({"type": "text", "text": agg.content}));
@@ -922,6 +1121,18 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_thinking_still_asks_for_reasoning() {
+        let body = json!({
+            "model": "auto",
+            "max_tokens": 64000,
+            "thinking": {"type": "adaptive"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let (out, _) = anthropic_to_openai(&body).expect("convert");
+        assert_eq!(out["reasoning_effort"], "high");
+    }
+
+    #[test]
     fn disabled_thinking_sends_no_reasoning_level() {
         let body = json!({
             "model": "auto",
@@ -940,11 +1151,29 @@ mod tests {
             content: "改好了".into(),
             ..Default::default()
         };
-        let out = to_anthropic_response(&agg, "deepseek-v4.1-flash", 1024);
+        let out = to_anthropic_response(&agg, "deepseek-v4.1-flash", 1024, true);
         let blocks = out["content"].as_array().expect("content");
         assert_eq!(blocks[0]["type"], "thinking");
         assert_eq!(blocks[0]["thinking"], "先看调用链");
+        let signature = blocks[0]["signature"].as_str().expect("signature");
+        assert!(
+            !signature.is_empty(),
+            "an unsigned thinking block is demoted to text"
+        );
         assert_eq!(blocks[1]["type"], "text");
+    }
+
+    #[test]
+    fn thinking_is_not_returned_when_the_caller_did_not_ask() {
+        let agg = crate::api::openai::ChatAggregate {
+            reasoning: "chain of thought".into(),
+            content: "answer".into(),
+            ..Default::default()
+        };
+        let out = to_anthropic_response(&agg, "auto", 1024, false);
+        let blocks = out["content"].as_array().expect("content");
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], "text");
     }
 
     #[test]
@@ -971,7 +1200,7 @@ mod tests {
             }],
             "usage": {"prompt_tokens": 12, "completion_tokens": 8}
         }));
-        let out = to_anthropic_response(&agg, "auto", 64);
+        let out = to_anthropic_response(&agg, "auto", 64, false);
         assert_eq!(out["stop_reason"], "tool_use");
         assert_eq!(out["content"][0]["type"], "text");
         assert_eq!(out["content"][1]["type"], "tool_use");
@@ -1008,5 +1237,105 @@ mod tests {
         );
         assert!(out.contains(r#""stop_reason":"tool_use""#), "{out}");
         assert!(out.contains(r#""type":"message_stop""#), "{out}");
+    }
+
+    fn sse_frame(delta: Value, finish_reason: Value) -> Bytes {
+        let frame = json!({
+            "choices": [{"delta": delta, "finish_reason": finish_reason}],
+            "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+        });
+        Bytes::from(format!("data: {frame}\n\n"))
+    }
+
+    fn dsml_read_call() -> String {
+        let bar = "\u{FF5C}\u{FF5C}";
+        format!(
+            "let me look\n<{bar}DSML{bar} calls>\n<{bar}DSML{bar} invoke name=\"read\">\n<{bar}DSML{bar} parameter name=\"path\" string=\"true\">/etc/hostname</{bar}DSML{bar} parameter>\n</{bar}DSML{bar} invoke>\n</{bar}DSML{bar} calls>"
+        )
+    }
+
+    #[test]
+    fn non_streaming_recovers_inband_calls_before_building_the_response() {
+        let markup = dsml_read_call();
+        let markup = markup.split_once('\n').expect("dsml has a line break").1;
+        let mut agg = crate::api::openai::ChatAggregate::default();
+        agg.apply(&json!({
+            "choices": [{"delta": {"content": markup}, "finish_reason": "stop"}]
+        }));
+        assert!(agg.recover_inband_tool_calls());
+        let out = to_anthropic_response(&agg, "auto", 64, false);
+        assert_eq!(out["stop_reason"], "tool_use");
+        assert_eq!(out["content"][0]["type"], "tool_use");
+        assert_eq!(out["content"][0]["name"], "read");
+        assert_eq!(out["content"][0]["input"]["path"], "/etc/hostname");
+        assert!(!out.to_string().contains('\u{FF5C}'));
+    }
+
+    #[tokio::test]
+    async fn stream_recovers_inband_tool_calls_instead_of_leaking_markup() {
+        let chunks = vec![sse_frame(
+            json!({"content": dsml_read_call()}),
+            json!("stop"),
+        )];
+        let out = test_anthropic_stream(chunks).await;
+        assert!(out.contains(r#""type":"tool_use""#), "{out}");
+        assert!(out.contains(r#""name":"read""#), "{out}");
+        assert!(
+            out.contains(r#""partial_json":"{\"path\":\"/etc/hostname\"}""#),
+            "{out}"
+        );
+        assert!(out.contains(r#""stop_reason":"tool_use""#), "{out}");
+        assert!(out.contains("let me look"), "{out}");
+        assert!(!out.contains('\u{FF5C}'), "raw DSML markup leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn stream_emits_signed_thinking_only_when_requested() {
+        let chunks = vec![
+            sse_frame(
+                json!({"reasoning_content": "consider the call chain"}),
+                Value::Null,
+            ),
+            sse_frame(json!({"content": "done"}), json!("stop")),
+        ];
+        let with = test_anthropic_stream_with(chunks.clone(), true).await;
+        assert!(with.contains(r#""type":"thinking""#), "{with}");
+        assert!(with.contains(r#""type":"signature_delta""#), "{with}");
+        assert!(with.contains(r#""type":"thinking_delta""#), "{with}");
+        let signature_at = with.find(r#""type":"signature_delta""#).unwrap();
+        let stop_at = with
+            .find(r#""index":0,"type":"content_block_stop""#)
+            .unwrap_or_else(|| panic!("thinking block must close: {with}"));
+        assert!(signature_at < stop_at, "signature must precede block stop");
+
+        let without = test_anthropic_stream_with(chunks, false).await;
+        assert!(!without.contains(r#""type":"thinking""#), "{without}");
+        assert!(without.contains(r#""type":"text""#), "{without}");
+    }
+
+    #[tokio::test]
+    async fn stream_closes_thinking_before_a_recovered_tool_block() {
+        // Pure markup: no visible prose precedes the call, so a correct stream
+        // has thinking(0) closed before tool_use(1) starts.
+        let markup = dsml_read_call();
+        let markup = markup.split_once('\n').expect("dsml has a line break").1;
+        let chunks = vec![
+            sse_frame(json!({"reasoning_content": "plan"}), Value::Null),
+            sse_frame(json!({"content": markup}), json!("stop")),
+        ];
+        let out = test_anthropic_stream_with(chunks, true).await;
+        let thinking_stop = out
+            .find(r#""index":0,"type":"content_block_stop""#)
+            .unwrap_or_else(|| panic!("thinking must close: {out}"));
+        let tool_start = out
+            .find(r#""index":1,"type":"content_block_start""#)
+            .unwrap_or_else(|| panic!("tool block must follow thinking: {out}"));
+        assert!(
+            thinking_stop < tool_start,
+            "content blocks must not interleave: {out}"
+        );
+        assert!(out.contains(r#""type":"tool_use""#), "{out}");
+        assert!(out.contains(r#""stop_reason":"tool_use""#), "{out}");
+        assert!(!out.contains(r#""type":"text""#), "{out}");
     }
 }
